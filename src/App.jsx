@@ -1,16 +1,15 @@
+// App.jsx
+
 import { useState, useEffect, useMemo, useRef } from "react";
-
-const storage = {
-  get: async (key) => {
-    const value = localStorage.getItem(key);
-    return value === null ? null : { value };
-  },
-
-  set: async (key, value) => {
-    localStorage.setItem(key, value);
-    return true;
-  },
-};
+import { auth, googleProvider, db } from "./firebase";
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+} from "firebase/auth";
+import { doc, onSnapshot, setDoc, updateDoc } from "firebase/firestore";
 
 /* ---------------------------------------------------------------- tokens */
 
@@ -43,7 +42,7 @@ const SEED = [
 const daysIn = (y, m) => new Date(y, m + 1, 0).getDate();
 const uid = () => "h" + Math.random().toString(36).slice(2, 9);
 const pct = (n, d) => (d > 0 ? Math.round((n / d) * 100) : null);
-const monthKey = (y, m) => `checks:${y}-${String(m + 1).padStart(2, "0")}`;
+const monthKey = (y, m) => `${y}-${String(m + 1).padStart(2, "0")}`;
 
 function weekOf(day) {
   return Math.min(4, Math.floor((day - 1) / 7));
@@ -77,9 +76,101 @@ function Ring({ value, size = 108, stroke = 9, color, label, caption }) {
   );
 }
 
+/* ------------------------------------------------------------- auth gate */
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [signingIn, setSigningIn] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const redirectCheckedRef = useRef(false);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthLoading(false);
+    });
+    return () => unsub();
+  }, []);
+
+  // Handle the case where sign-in fell back to signInWithRedirect and the
+  // page just reloaded after Google sent the user back.
+  useEffect(() => {
+    if (redirectCheckedRef.current) return;
+    redirectCheckedRef.current = true;
+    getRedirectResult(auth).catch((e) => {
+      console.error("Redirect sign-in failed", e);
+      setAuthError("Sign-in failed. Please try again.");
+    });
+  }, []);
+
+  const handleSignIn = async () => {
+    setAuthError("");
+    setSigningIn(true);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      console.error("Popup sign-in failed", e);
+      const popupIssue = [
+        "auth/popup-blocked",
+        "auth/popup-closed-by-user",
+        "auth/cancelled-popup-request",
+        "auth/operation-not-supported-in-this-environment",
+      ].includes(e.code);
+
+      if (popupIssue) {
+        // Fall back to redirect flow — more reliable on mobile / in-app browsers.
+        try {
+          await signInWithRedirect(auth, googleProvider);
+          return; // page will navigate away
+        } catch (redirectErr) {
+          console.error("Redirect sign-in failed", redirectErr);
+          setAuthError("Sign-in failed. Please try again.");
+        }
+      } else {
+        setAuthError("Sign-in failed. Please try again.");
+      }
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  if (authLoading) {
+    return (
+      <div className="app authgate-wrap">
+        <style>{CSS}</style>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="app authgate-wrap">
+        <style>{CSS}</style>
+        <div className="authgate">
+          <div className="authgate-mark">Habit Tracker</div>
+          <p className="authgate-sub">Sign in to sync your habits across every device.</p>
+          <button className="google-btn" onClick={handleSignIn} disabled={signingIn}>
+            <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+              <path fill="#4285F4" d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z" />
+              <path fill="#34A853" d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.98v2.33A9 9 0 0 0 9 18z" />
+              <path fill="#FBBC05" d="M3.95 10.7A5.4 5.4 0 0 1 3.66 9c0-.59.1-1.16.29-1.7V4.97H.98A9 9 0 0 0 0 9c0 1.45.35 2.83.98 4.03l2.97-2.33z" />
+              <path fill="#EA4335" d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .98 4.97l2.97 2.33C4.66 5.17 6.65 3.58 9 3.58z" />
+            </svg>
+            {signingIn ? "Connecting…" : "Continue with Google"}
+          </button>
+          {authError && <p className="authgate-error">{authError}</p>}
+        </div>
+      </div>
+    );
+  }
+
+  return <HabitTracker user={user} onSignOut={() => signOut(auth)} />;
+}
+
 /* ------------------------------------------------------------------- app */
 
-export default function HabitTracker() {
+function HabitTracker({ user, onSignOut }) {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth());
@@ -88,60 +179,107 @@ export default function HabitTracker() {
   const [editing, setEditing] = useState(false);
   const [ready, setReady] = useState(false);
   const [saveState, setSaveState] = useState("idle");
-  const loadedMonth = useRef(null);
+
+  const docDataRef = useRef(null);
+  const habitsWrittenRef = useRef(null);
+  const checksWrittenRef = useRef({});
+  const currentKeyRef = useRef(monthKey(year, month));
+  const skipNextChecksWriteRef = useRef(false);
 
   const nDays = daysIn(year, month);
   const isThisMonth = year === today.getFullYear() && month === today.getMonth();
   const isPast = year < today.getFullYear() || (year === today.getFullYear() && month < today.getMonth());
   const lastDay = isThisMonth ? today.getDate() : isPast ? nDays : 0;
 
-  /* ------- load habits once */
+  /* ------- subscribe to this user's Firestore document (realtime) */
   useEffect(() => {
-    (async () => {
-      try {
-        const r = await storage.get("habits-v1", false);
-        if (r?.value) setHabits(JSON.parse(r.value));
-      } catch (e) {
-        /* first run — seed stands */
+    setReady(false);
+    docDataRef.current = null;
+    habitsWrittenRef.current = null;
+    checksWrittenRef.current = {};
+
+    const ref = doc(db, "users", user.uid);
+    const unsub = onSnapshot(
+      ref,
+      async (snap) => {
+        if (!snap.exists()) {
+          // Don't flip ready=true until the seed doc is actually persisted —
+          // avoids a race where the user edits before the initial write lands.
+          const seedData = { habits: SEED, checks: {} };
+          try {
+            await setDoc(ref, seedData);
+            // onSnapshot will fire again with the persisted doc; that call
+            // takes the normal branch below and sets ready = true there.
+          } catch (e) {
+            console.error("Failed to create seed document", e);
+            setSaveState("error");
+          }
+          return;
+        }
+
+        const data = snap.data() || {};
+        const nextHabits = Array.isArray(data.habits) ? data.habits : SEED;
+        docDataRef.current = data;
+        habitsWrittenRef.current = JSON.stringify(nextHabits);
+        setHabits(nextHabits);
+
+        const key = currentKeyRef.current;
+        const monthChecks = (data.checks && data.checks[key]) || {};
+        checksWrittenRef.current[key] = JSON.stringify(monthChecks);
+        setChecks(monthChecks);
+
+        setReady(true);
+      },
+      (err) => {
+        console.error("Firestore sync error", err);
+        setSaveState("error");
       }
-      setReady(true);
-    })();
-  }, []);
+    );
 
-  /* ------- load checks per month */
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const key = monthKey(year, month);
-      let next = {};
-      try {
-        const r = await storage.get(key, false);
-        if (r?.value) next = JSON.parse(r.value);
-      } catch (e) {
-        next = {};
-      }
-      if (!alive) return;
-      setChecks(next);
-      loadedMonth.current = key;
-    })();
-    return () => { alive = false; };
-  }, [year, month]);
+    return () => unsub();
+  }, [user.uid]);
 
-  /* ------- save */
-  useEffect(() => {
-    if (!ready) return;
-    storage.set("habits-v1", JSON.stringify(habits), false).catch(() => {});
-  }, [habits, ready]);
-
+  /* ------- when month/year changes, derive checks from cached doc data */
   useEffect(() => {
     const key = monthKey(year, month);
-    if (loadedMonth.current !== key) return;
+    currentKeyRef.current = key;
+    if (!docDataRef.current) return; // first snapshot not yet arrived
+    const monthChecks = (docDataRef.current.checks && docDataRef.current.checks[key]) || {};
+    checksWrittenRef.current[key] = JSON.stringify(monthChecks);
+    skipNextChecksWriteRef.current = true;
+    setChecks(monthChecks);
+  }, [year, month]);
+
+  /* ------- write habits to Firestore on change */
+  useEffect(() => {
+    if (!ready) return;
+    const s = JSON.stringify(habits);
+    if (s === habitsWrittenRef.current) return;
+    habitsWrittenRef.current = s;
+    const ref = doc(db, "users", user.uid);
     setSaveState("saving");
-    storage
-      .set(key, JSON.stringify(checks), false)
+    updateDoc(ref, { habits })
       .then(() => setSaveState("saved"))
       .catch(() => setSaveState("error"));
-  }, [checks, year, month]);
+  }, [habits, ready, user.uid]);
+
+  /* ------- write checks (current month only) to Firestore on change */
+  useEffect(() => {
+    if (!ready) return;
+    if (skipNextChecksWriteRef.current) {
+      skipNextChecksWriteRef.current = false;
+      return;
+    }
+    const key = monthKey(year, month);
+    const s = JSON.stringify(checks);
+    if (s === checksWrittenRef.current[key]) return;
+    checksWrittenRef.current[key] = s;
+    const ref = doc(db, "users", user.uid);
+    setSaveState("saving");
+    updateDoc(ref, { [`checks.${key}`]: checks })
+      .then(() => setSaveState("saved"))
+      .catch(() => setSaveState("error"));
+  }, [checks, year, month, ready, user.uid]);
 
   /* ------- derived */
   const applicableDays = useMemo(
@@ -238,6 +376,19 @@ export default function HabitTracker() {
   return (
     <div className="app">
       <style>{CSS}</style>
+
+      {/* ---- profile */}
+      <div className="profile-bar">
+        <div className="profile-id">
+          {user.photoURL ? (
+            <img className="avatar" src={user.photoURL} alt="" referrerPolicy="no-referrer" />
+          ) : (
+            <span className="avatar avatar-fallback">{(user.email || "?")[0].toUpperCase()}</span>
+          )}
+          <span className="profile-email">{user.email}</span>
+        </div>
+        <button className="signout-link" onClick={onSignOut}>Sign out</button>
+      </div>
 
       {/* ---- header */}
       <header className="top">
@@ -572,4 +723,26 @@ const CSS = `
 @media (prefers-reduced-motion:reduce){
   .app *{transition:none!important;animation:none!important}
 }
+
+/* ---- auth + profile (additive only) */
+.authgate-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.authgate{background:var(--card);border:1px solid var(--line);border-radius:20px;
+  padding:40px 36px;text-align:center;max-width:340px;width:100%}
+.authgate-mark{font-family:var(--display);font-size:22px;font-weight:800;letter-spacing:-.02em}
+.authgate-sub{font-size:13px;color:var(--muted);margin:10px 0 22px;line-height:1.5}
+.google-btn{display:inline-flex;align-items:center;gap:10px;border:1px solid var(--line);
+  background:var(--card);border-radius:99px;padding:11px 20px;font-size:13px;font-weight:600;
+  color:var(--ink);width:100%;justify-content:center}
+.google-btn:hover{border-color:var(--muted)}
+.google-btn:disabled{opacity:.6;cursor:default}
+.authgate-error{margin:14px 0 0;font-size:12px;color:#C04A4A}
+
+.profile-bar{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-bottom:10px}
+.profile-id{display:flex;align-items:center;gap:7px;min-width:0}
+.avatar{width:22px;height:22px;border-radius:99px;object-fit:cover;flex:0 0 22px}
+.avatar-fallback{display:flex;align-items:center;justify-content:center;background:var(--ink);
+  color:#fff;font-size:11px;font-weight:600}
+.profile-email{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.signout-link{border:none;background:none;font-size:11px;color:var(--muted);padding:0;text-decoration:underline}
+.signout-link:hover{color:var(--ink)}
 `;
