@@ -76,6 +76,148 @@ function Ring({ value, size = 108, stroke = 9, color, label, caption }) {
   );
 }
 
+/* -------------------------------------------------------------- trend line */
+/* Pure-SVG smoothed line + area chart. No external chart library required —
+   this mirrors the hand-rolled SVG approach already used by <Ring>. */
+
+function smoothPath(points) {
+  if (points.length < 2) return "";
+  let d = `M ${points[0][0]} ${points[0][1]}`;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i === 0 ? i : i - 1];
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    const p3 = points[i + 2 < points.length ? i + 2 : i + 1];
+    const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+    const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+    const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+    const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+    d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2[0]} ${p2[1]}`;
+  }
+  return d;
+}
+
+/* -------------------------------------------------------------- trend line */
+/* Pure-SVG smoothed line + area chart, colored by week to match WEEK_TINT
+   (the same palette the daily ribbon chart uses). No external chart
+   library required. */
+
+function bezierSegment(points, i) {
+  // Identical Catmull-Rom -> cubic Bezier control-point math as the
+  // original single-path smoothPath(), just scoped to one segment
+  // (point i -> point i+1) so it can be colored independently.
+  const p0 = points[i === 0 ? i : i - 1];
+  const p1 = points[i];
+  const p2 = points[i + 1];
+  const p3 = points[i + 2 < points.length ? i + 2 : i + 1];
+  const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+  const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+  const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+  const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+  return `M ${p1[0]} ${p1[1]} C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2[0]} ${p2[1]}`;
+}
+
+function TrendLine({ data, height = 120 }) {
+  const valid = data.filter((d) => d.pc != null);
+
+  if (valid.length < 2) {
+    return <div className="trend-empty">Not enough days logged yet to draw a trend.</div>;
+  }
+
+  const width = Math.max(300, data.length * 22);
+  const maxDay = data.length;
+  const xFor = (day) => ((day - 1) / (maxDay - 1 || 1)) * width;
+  const yFor = (pc) => height - (pc / 100) * (height - 6) - 3; // small top/bottom padding
+
+  const points = valid.map((d) => [xFor(d.day), yFor(d.pc)]);
+  const days = valid.map((d) => d.day);
+  const baseY = height;
+
+  // One bezier piece per pair of adjacent points, each tagged with the
+  // week(s) it belongs to. weekOf() is the same function used for the
+  // daily ribbon, so colors line up exactly with that chart.
+  const segments = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const week1 = weekOf(days[i]);
+    const week2 = weekOf(days[i + 1]);
+    segments.push({
+      i,
+      path: bezierSegment(points, i),
+      x1: points[i][0], y1: points[i][1],
+      x2: points[i + 1][0], y2: points[i + 1][1],
+      week1,
+      week2,
+      crossesWeek: week1 !== week2,
+    });
+  }
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className="trend-svg"
+      role="img"
+      aria-label="Smoothed daily completion trend across the month, colored by week"
+    >
+      <defs>
+        {/* Fade-to-transparent fill gradient, one per week color */}
+        {WEEK_TINT.map((color, w) => (
+          <linearGradient key={`area-${w}`} id={`trendArea-${w}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.45" />
+            <stop offset="100%" stopColor={color} stopOpacity="0" />
+          </linearGradient>
+        ))}
+        {/* Horizontal color-blend gradient for any segment that straddles
+            two weeks, so the line eases from one week's color into the
+            next rather than switching abruptly. */}
+        {segments.filter((s) => s.crossesWeek).map((s) => (
+          <linearGradient
+            key={`line-${s.i}`}
+            id={`trendLineGrad-${s.i}`}
+            gradientUnits="userSpaceOnUse"
+            x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
+          >
+            <stop offset="0%" stopColor={WEEK_TINT[s.week1]} />
+            <stop offset="100%" stopColor={WEEK_TINT[s.week2]} />
+          </linearGradient>
+        ))}
+      </defs>
+
+      <line x1="0" y1={yFor(50)} x2={width} y2={yFor(50)} stroke="var(--line)" strokeDasharray="3 5" strokeWidth="1" />
+
+      {/* Area fill: one piece per segment, tinted by that segment's week */}
+      {segments.map((s) => (
+        <path
+          key={`area-${s.i}`}
+          d={`${s.path} L ${s.x2} ${baseY} L ${s.x1} ${baseY} Z`}
+          fill={`url(#trendArea-${s.week1})`}
+          stroke="none"
+        />
+      ))}
+
+      {/* Line: one piece per segment — flat week color inside a week,
+          blended gradient across a week boundary. Segments share
+          endpoints exactly, so there are no visible gaps. */}
+      {segments.map((s) => (
+        <path
+          key={`line-${s.i}`}
+          d={s.path}
+          fill="none"
+          stroke={s.crossesWeek ? `url(#trendLineGrad-${s.i})` : WEEK_TINT[s.week1]}
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      ))}
+
+      {/* Data points, colored to match their week */}
+      {points.map(([x, y], idx) => (
+        <circle key={idx} cx={x} cy={y} r="2.5" fill={WEEK_TINT[weekOf(days[idx])]} />
+      ))}
+    </svg>
+  );
+}
+
 /* ------------------------------------------------------------- auth gate */
 
 export default function App() {
@@ -93,8 +235,6 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // Handle the case where sign-in fell back to signInWithRedirect and the
-  // page just reloaded after Google sent the user back.
   useEffect(() => {
     if (redirectCheckedRef.current) return;
     redirectCheckedRef.current = true;
@@ -119,10 +259,9 @@ export default function App() {
       ].includes(e.code);
 
       if (popupIssue) {
-        // Fall back to redirect flow — more reliable on mobile / in-app browsers.
         try {
           await signInWithRedirect(auth, googleProvider);
-          return; // page will navigate away
+          return;
         } catch (redirectErr) {
           console.error("Redirect sign-in failed", redirectErr);
           setAuthError("Sign-in failed. Please try again.");
@@ -203,13 +342,9 @@ function HabitTracker({ user, onSignOut }) {
       ref,
       async (snap) => {
         if (!snap.exists()) {
-          // Don't flip ready=true until the seed doc is actually persisted —
-          // avoids a race where the user edits before the initial write lands.
           const seedData = { habits: SEED, checks: {} };
           try {
             await setDoc(ref, seedData);
-            // onSnapshot will fire again with the persisted doc; that call
-            // takes the normal branch below and sets ready = true there.
           } catch (e) {
             console.error("Failed to create seed document", e);
             setSaveState("error");
@@ -243,7 +378,7 @@ function HabitTracker({ user, onSignOut }) {
   useEffect(() => {
     const key = monthKey(year, month);
     currentKeyRef.current = key;
-    if (!docDataRef.current) return; // first snapshot not yet arrived
+    if (!docDataRef.current) return;
     const monthChecks = (docDataRef.current.checks && docDataRef.current.checks[key]) || {};
     checksWrittenRef.current[key] = JSON.stringify(monthChecks);
     skipNextChecksWriteRef.current = true;
@@ -335,6 +470,21 @@ function HabitTracker({ user, onSignOut }) {
     return s;
   }, [lastDay, dayScore]);
 
+  /* ------- NEW: monthly trend data (feeds the smoothed line chart) */
+  const trendData = useMemo(
+    () =>
+      Array.from({ length: nDays }, (_, i) => {
+        const day = i + 1;
+        return { day, pc: day <= lastDay ? dayScore[day].pc : null };
+      }),
+    [nDays, lastDay, dayScore]
+  );
+
+  /* ------- NEW: best / needs-attention habits, from the existing ranking */
+  const bestHabit = ranked.length ? ranked[0] : null;
+  const worstHabit =
+    ranked.length > 1 ? ranked[ranked.length - 1] : null;
+
   /* ------- actions */
   const toggle = (hid, day) =>
     setChecks((prev) => {
@@ -415,6 +565,20 @@ function HabitTracker({ user, onSignOut }) {
         </div>
       </header>
 
+      {/* ---- NEW: monthly trend (smoothed line), placed above the ribbon */}
+      <section className="card trend-card">
+        <div className="card-head">
+          <h2>Monthly trend</h2>
+          <span className="hint">Smoothed completion % across the month</span>
+        </div>
+        <div className="trend-wrap">
+  <TrendLine
+    data={trendData}
+    height={120}
+  />
+</div>
+      </section>
+
       {/* ---- signature: the month ribbon */}
       <section className="ribbon-card">
         <div className="card-head">
@@ -462,6 +626,45 @@ function HabitTracker({ user, onSignOut }) {
         <div className="stat">
           <span className="stat-val">{lastDay || "—"}</span>
           <span className="stat-key">Days counted</span>
+        </div>
+      </section>
+
+      {/* ---- NEW: best habit / needs attention summary cards */}
+      <section className="summary-grid">
+        <div className="summary-card best">
+          <span className="summary-tag">Best habit</span>
+          {bestHabit ? (
+            <>
+              <strong className="summary-name">{bestHabit.name || "Untitled"}</strong>
+              <span className="summary-pc" style={{ color: PALETTE[bestHabit.color] }}>
+                {bestHabit.pc == null ? "—" : `${bestHabit.pc}%`}
+              </span>
+              <span className="summary-sub">
+                {bestHabit.done}/{applicableDays.length || 0} days completed
+              </span>
+            </>
+          ) : (
+            <span className="summary-empty">Add a habit to see your top performer</span>
+          )}
+        </div>
+
+        <div className="summary-card attention">
+          <span className="summary-tag">Needs attention</span>
+          {worstHabit ? (
+            <>
+              <strong className="summary-name">{worstHabit.name || "Untitled"}</strong>
+              <span className="summary-pc" style={{ color: PALETTE[worstHabit.color] }}>
+                {worstHabit.pc == null ? "—" : `${worstHabit.pc}%`}
+              </span>
+              <span className="summary-sub">
+                {worstHabit.done}/{applicableDays.length || 0} days completed
+              </span>
+            </>
+          ) : (
+            <span className="summary-empty">
+              {ranked.length ? "Add another habit to compare" : "Add a habit to get started"}
+            </span>
+          )}
         </div>
       </section>
 
@@ -608,7 +811,10 @@ const CSS = `
 }
 .app *{box-sizing:border-box}
 .app button{font-family:inherit;cursor:pointer}
-.app h1,.app h2{margin:0;font-family:var(--display);letter-spacing:-.02em}
+/* FIX: explicit color so headings don't inherit index.css's dark-mode-reactive
+   var(--text-h) — this component is a fixed light theme, so its own headings
+   must always resolve to the local --ink token, in any color scheme. */
+.app h1,.app h2{margin:0;font-family:var(--display);letter-spacing:-.02em;color:var(--ink)}
 .app :focus-visible{outline:2px solid var(--ink);outline-offset:2px;border-radius:4px}
 
 /* header */
@@ -633,10 +839,16 @@ const CSS = `
 .ring-label{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.3}
 
 /* cards */
-.card,.ribbon-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px}
+.card,.ribbon-card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:12px}
 .card-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
 .card-head h2{font-size:15px;font-weight:600}
 .hint{font-size:11px;color:var(--muted)}
+
+/* NEW: monthly trend chart */
+.trend-card{margin-bottom:12px}
+.trend-wrap{width:100%;height:120px}
+.trend-svg{width:100%;height:100%;display:block}
+.trend-empty{font-size:12px;color:var(--muted);padding:34px 0;text-align:center}
 
 /* ribbon */
 .ribbon{display:flex;gap:3px;align-items:flex-end;height:120px}
@@ -647,10 +859,22 @@ const CSS = `
 .bar-slot.is-today .bar-track{box-shadow:0 0 0 2px var(--ink)}
 
 /* stats */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
 .stat-val{display:block;font-family:var(--display);font-size:26px;font-weight:700;line-height:1}
 .stat-key{display:block;font-size:11px;color:var(--muted);margin-top:5px}
+
+/* NEW: best habit / needs attention summary cards */
+.summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.summary-card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:14px 16px;display:flex;flex-direction:column;gap:4px}
+.summary-tag{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.summary-name{font-family:var(--display);font-size:16px;font-weight:700;margin-top:2px;color:var(--ink)}
+.summary-pc{font-family:var(--mono);font-size:20px;font-weight:600}
+.summary-sub{font-size:11px;color:var(--muted)}
+.summary-empty{font-size:12px;color:var(--muted);padding:6px 0}
+.summary-card.best{border-color:rgba(111,191,119,.35)}
+.summary-card.attention{border-color:rgba(232,146,104,.35)}
 
 /* split */
 .split{display:grid;grid-template-columns:1.1fr 1fr;gap:12px;margin-bottom:12px}
@@ -712,9 +936,11 @@ const CSS = `
 @media (max-width:820px){
   .app{padding:14px}
   .split,.stats{grid-template-columns:repeat(2,1fr)}
+  .summary-grid{grid-template-columns:1fr}
   .monthpick h1{font-size:28px}
   .top{flex-direction:row;align-items:center}
   .ribbon{height:92px}
+  .trend-wrap{height:92px}
   .rowhead{flex-basis:130px;width:130px}
   .gridwrap.editing .rowhead{flex-basis:198px;width:198px}
   .cell,.daynum,.foot-cell{width:30px;flex-basis:30px}
